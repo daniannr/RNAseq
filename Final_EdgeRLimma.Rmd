@@ -5,7 +5,170 @@ date: "5/2/2021"
 output: html_document
 ---
 
+```{r, echo = F}
+library(dplyr)  # for arrange() function
+library(limma)    # main limma package
+library(edgeR)    # we need the TMM function from edgeR
+library(WriteXLS) # for convenience, we will save the final results as an Excel file
+library(pheatmap)
+library(Homo.sapiens) # for gene annotation
+library(dplyr)
+library(tibble)
+library(biomaRt)
+library(GO.db)
+```
+
+
+```{r, echo = False}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+install.packages('biocLite.R')
+install.packages("rtracklayer")
+
+library('org.Hs.eg.db')
+library("rtracklayer")
+```
+## read in counts data and relevel
+```{r}
+count_data <- read.csv("AD_quant.featurecounts.counts.rev.csv")
+count_data1 <- count_data[-1]
+row.names(count_data1) <- count_data$X.GENE
+
+countDGE <- DGEList(count_data1) # create DGEList object
+
+countDGE$samples # look at all sample types
+
+countDGE$genes # look at all genes
+dim(countDGE) # check dimentions of counts table
+substring(colnames(countDGE), 1, nchar(colnames(countDGE))) # get sample names
+```
+
+## Organizing sample information in object
+```{r}
+labels <- c("A","D")
+group_labels <- as.factor(rep(labels, times = c(18, 12))) # repeat A and D for n times each
+countDGE$samples$group <- group_labels
+countDGE$genes
+```
+## Transform to CPM  and remove lowly expressed genes
+
+```{r}
+cpm <- cpm(countDGE)
+lcpm <- cpm(countDGE, log=TRUE) #log cpm
+```
+
+```{r}
+keep.exprs <- filterByExpr(countDGE, group=group)
+countDGE <- countDGE[keep.exprs,, keep.lib.sizes=FALSE]
+dim(countDGE)
+```
+
+
+```{r}
+# (requires > 1 CPM over at least 3 samples)
+isexpr <- rowSums(cpm(dge) > 1) >=3  # require a minimum counts per million. cpm gets normalized version of counts
+table(rowSums(countDGE$counts > 20) >=3)  # or we can specify a minimum count threshold (30). give raw counts matrix and get sum of all counts/elements - 4 conditions 3 replicates = 12 cols
+# Determine for any particular gene, at least 3 reps have 30 counts
+# this gives a boolean with rows that have >30 counts
+
+# Check what fraction of genes removed
+sum(isexpr)/nrow(dge)
+
+# Remove the low expressed genes by indexing like a matrix
+dge <- dge[isexpr,,keep.lib.sizes=FALSE] # keep.lib.sizes=FALSE to force recalculating library sizes from sums of column counts (note: we can also pass in library sizes explicitly)
+
+dim(dge)
+```
+
+
+## Organizing gene annotations to get entrez ID for GSEA and GO analysis
+```{r}
+geneid <- rownames(countDGE)
+geneid_df <- data.frame(geneid)
+length(geneid)
+```
+
+### Using SQL (not ideal)
+```{r}
+# Download annotation conversion table from HGNC and read as csv
+HGNC_IDs <- read.csv("HGNC_ensemble2entrez.csv")
+# create SQlite database 
+library(RSQLite) 
+drv<-dbDriver("SQLite") 
+con<-dbConnect(drv,"HGNC_ensemble2entrez.sqlite")
+dbWriteTable(con,"HGNC_ensemble2entrez", HGNC_IDs) # table name then df name
+dbWriteTable(con,"geneid_df", geneid_df) # table name then df name
+dbGetQuery(con,"SELECT * from geneid_df limit 10")
+```
+
+```{r}
+convert_genes <- dbGetQuery(con, "SELECT Ensembl_gene_ID, NCBI_gene_ID, geneID 
+           FROM HGNC_ensemble2entrez
+           JOIN geneid_df ON geneid_df.geneid = HGNC_ensemble2entrez.Approved_symbol")
+convert_genes
+```
+### Using biomaRt to get entrez ID
+```{r}
+## Establish connection with Ensembl, an online database and ask for human data
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+## getBM performs batch query with your input value: row.names(bra_v)
+## and retrieves the corresponding attributes from Ensembl
+entrez_id <- getBM(
+  # Attributes are the type of converted data
+  attributes = c("entrezgene_id", "hgnc_symbol"),
+  # Filter is the type of input data
+  filter = "hgnc_symbol",
+  # Values is the input data
+  values = geneid,
+  # Mart is the conversion database by useMart()
+  mart = ensembl
+)
+```
+
+
+```{r}
+## Creating a named vector here, where the names are hgnc_symbol ids and the values are Entrez ids
+conv_dict <- entrez_id$entrezgene_id
+names(conv_dict) <- entrez_id$hgnc_symbol
+# change the row names on DGE object to entrez ids
+#row.names(countDGE) <- conv_dict[row.names(countDGE)]
+#row.names(countDGE)
+
+
+# add the gene names into genes table in the countDGE object
+countDGE$genes <- entrez_id
+countDGE
+```
+
+
 ```{r}
 
+genes <- select(HGNC_IDs, keys=geneid, columns=c("SYMBOL", "TXCHROM"), 
+                keytype="ENTREZID")
+head(genes)
+```
+
+```{r}
+38139/60591*100
+```
+
+```{r}
+dataf2 <- data.frame(Type = c("Fruit","Fruit","Fruit","Fruit","Fruit",
+                                    "Vegetable", "Vegetable", "Vegetable", "Vegetable", "Fruit"),
+                       Name = c("Red Apple","Strawberries","Orange","Watermelon","Papaya",
+                                     "Carrot","Tomato","Chili","Cucumber", "Green Apple"),
+                       Color = c(NA, "Red", "Orange", "Red", "Green",
+                                 "Orange", "Red", "Red", "Green", "Green"))
+
+
+# Adding a New Column:
+dataf2 <- within(dataf2, {
+  Red_Fruit = "No"
+  Red_Fruit[Type %in% c("Fruit")] = "No"
+  Red_Fruit[Type %in% "Vegetable"] = "No"
+  Red_Fruit[Name %in% c("Red Apple", "Strawberries", "Watermelon", "Chili", "Tomato")] = "Yes"
+})
+dataf2
 ```
 
